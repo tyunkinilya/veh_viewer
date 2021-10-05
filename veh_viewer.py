@@ -1,17 +1,15 @@
 import os
-import pefile
 import idc
-import ida_ida
 import idautils
 import ida_bytes
 
-import idaapi
-
 from ida_idd import Appcall
 from ida_kernwin import Choose
+from ida_ida import inf_get_max_ea
+from idaapi import get_inf_structure
 
 
-proc_info = idaapi.get_inf_structure()
+proc_info = get_inf_structure()
 
 if proc_info.is_32bit():
     idc.parse_decls("""struct _VECTORED_HANDLER_ENTRY {
@@ -49,12 +47,17 @@ if proc_info.is_64bit():
     _VECTORED_HANDLER_ENTRY* last_continue_handler;
     };""", 0)
 
+WORD_SIZE = 0
+if proc_info.is_32bit():
+    WORD_SIZE = 4
+if proc_info.is_64bit():
+    WORD_SIZE = 8
 
 def read_value(ea):
     if proc_info.is_64bit():
-        return idc.get_qword(ea), ea+8
+        return idc.get_qword(ea), ea + 8
     if proc_info.is_32bit():
-        return idc.get_wide_dword(ea), ea+4
+        return idc.get_wide_dword(ea), ea + 4
 
 
 def format_hex(x):
@@ -144,7 +147,7 @@ def find_bin_mask(mask, start, end=idc.BADADDR):
         return 0
     ea = ida_bytes.bin_search(
         start,
-        ida_ida.inf_get_max_ea() if end == idc.BADADDR else end + 1,
+        inf_get_max_ea() if end == idc.BADADDR else end + 1,
         patterns,
         ida_bytes.BIN_SEARCH_FORWARD
         | ida_bytes.BIN_SEARCH_NOBREAK
@@ -153,27 +156,59 @@ def find_bin_mask(mask, start, end=idc.BADADDR):
         return 0
     return ea
 
+def VHL_generic_search(func_start, ntdll_base):
+    mem_pointers = set()
+
+    for start, end in idautils.Chunks(func_start):
+        ea = start
+        while ea < end:
+            for i in range(20):
+                if idc.print_operand(ea, i) == '':
+                    break
+                if idc.get_operand_type(ea, i) in [idc.o_mem, idc.o_imm, idc.o_far]:
+                    value = idc.get_operand_value(ea, i)
+                    if value > ntdll_base and idc.is_loaded(value):
+                        print(f"{format_hex(ea)} -> {format_hex(value)}")
+                        mem_pointers.add(value)
+            ea = idc.next_head(ea)
+    mem_pointers = list(mem_pointers)
+    for mem_pointer in mem_pointers:
+        only_pointers = True
+        for i in range(6):
+            value, _ = read_value(mem_pointer + i*WORD_SIZE)
+            # print(f"{mem_pointer:08X}[{i}] -> {value:08X}, {idc.is_loaded(value)}")
+            only_pointers = only_pointers and idc.is_loaded(value)
+        if only_pointers:
+            return mem_pointer
+    return idc.BADADDR
+
 
 ntdll_base = 0
+ntdll_size = 0
 ntdll_pe = None
 for module in idautils.Modules():
     module_name = os.path.basename(module.name.lower())
     if module_name == 'ntdll.dll' or module_name == 'ntdll':
         ntdll_base = module.base
         ntdll_size = module.size
-        ntdll_pe = load_pe_from_mem(
-            ida_bytes.get_bytes(ntdll_base, ntdll_size))
-        print(f"{ntdll_base:08x} -> {module_name}")
+        print(f"{format_hex(ntdll_base)} -> {module_name}")
 
-p_RtlDecodePointer = GetProcAddress(ntdll_pe, ntdll_base, "RtlDecodePointer")
-idc.set_name(p_RtlDecodePointer, "")
-idc.set_name(p_RtlDecodePointer, "ntdll_RtlDecodePointer")
+p_RtlDecodePointer = idc.get_name_ea(ntdll_base, "ntdll_RtlDecodePointer")
+p_RtlAddVectoredExceptionHandler = idc.get_name_ea(ntdll_base, "ntdll_RtlAddVectoredExceptionHandler")
+
+if p_RtlAddVectoredExceptionHandler == idc.BADADDR or p_RtlDecodePointer == idc.BADADDR:
+    import pefile
+    ntdll_pe = load_pe_from_mem(ida_bytes.get_bytes(ntdll_base, ntdll_size))
+
+    p_RtlDecodePointer = GetProcAddress(ntdll_pe, ntdll_base, "RtlDecodePointer")
+    idc.set_name(p_RtlDecodePointer, "")
+    idc.set_name(p_RtlDecodePointer, "ntdll_RtlDecodePointer")
+
+    p_RtlAddVectoredExceptionHandler = GetProcAddress(ntdll_pe, ntdll_base, "RtlAddVectoredExceptionHandler")
+    idc.add_func(p_RtlAddVectoredExceptionHandler, idc.find_func_end(p_RtlAddVectoredExceptionHandler))
+
+
 RtlDecodePointer = Appcall.proto("ntdll_RtlDecodePointer", "PVOID __stdcall RtlDecodePointer(PVOID Ptr);")
-
-p_RtlAddVectoredExceptionHandler = GetProcAddress(
-    ntdll_pe, ntdll_base, "RtlAddVectoredExceptionHandler")
-idc.add_func(p_RtlAddVectoredExceptionHandler,
-             idc.find_func_end(p_RtlAddVectoredExceptionHandler))
 
 LdrpVectorHandlerList = 0
 
@@ -192,6 +227,11 @@ if proc_info.is_32bit():
     if p_insns != 0:
         p_insns = idc.next_head(p_insns)
         LdrpVectorHandlerList = idc.get_operand_value(p_insns, 1)
+    else:
+        print("Can't find by mask, trying generic search.")
+        LdrpVectorHandlerList = VHL_generic_search(p_RtlAddVectoredExceptionHandlerImpl, ntdll_base)
+        if LdrpVectorHandlerList == idc.BADADDR:
+            print("Genric search failed. Find VectorHandlerList manually an set its name as 'LdrpVectorHandlerList'")
 
 if proc_info.is_64bit():
     '''
@@ -206,12 +246,18 @@ if proc_info.is_64bit():
     p_insns = find_bin_mask("48 8D ?? ?? ?? ?? ?? 48 8B 0C ??", start, end)
     if p_insns != 0:
         LdrpVectorHandlerList = idc.get_operand_value(p_insns, 1)
+    else:
+        print("Can't find by mask, trying generic search.")
+        LdrpVectorHandlerList = VHL_generic_search(p_RtlAddVectoredExceptionHandlerImpl, ntdll_base)
+        if LdrpVectorHandlerList == idc.BADADDR:
+            print("Genric search failed. Find VectorHandlerList manually an set its name as 'LdrpVectorHandlerList'")
+
 
 idc.set_name(LdrpVectorHandlerList, "")
 idc.set_name(LdrpVectorHandlerList, "LdrpVectorHandlerList")
 idc.apply_type(LdrpVectorHandlerList, idc.parse_decl(
     "_VECTORED_HANDLER_LIST LdrpVectorHandlerList;", idc.PT_SILENT))
-print(f"{LdrpVectorHandlerList = :08X}")
+print(f"LdrpVectorHandlerList = {format_hex(LdrpVectorHandlerList)}")
 
 class VehChoose(Choose):
 
@@ -232,19 +278,26 @@ class VehChoose(Choose):
         LdrpVectorHandlerList = VECTORED_HANDLER_LIST(p_LdrpVectorHandlerList)
         first_exception_handler = LdrpVectorHandlerList.first_exception_handler
 
-        if first_exception_handler == p_LdrpVectorHandlerList + 4 or first_exception_handler == p_LdrpVectorHandlerList + 8:
+        if first_exception_handler == p_LdrpVectorHandlerList + WORD_SIZE:
             print("No exception handlers")
             return True
 
         last_exception_handler = LdrpVectorHandlerList.last_exception_handler
         p_exception_handler = first_exception_handler
-        idc.apply_type(p_exception_handler, idc.parse_decl(
-            f"_VECTORED_HANDLER_ENTRY VEH_ENTRY_{format_hex(p_exception_handler)};", idc.PT_SILENT))
+        # idc.apply_type(p_exception_handler, idc.parse_decl(
+        #     f"_VECTORED_HANDLER_ENTRY VEH_ENTRY_{format_hex(p_exception_handler)};", idc.PT_SILENT))
 
         exception_handler = VECTORED_HANDLER_ENTRY(p_exception_handler)
+
         handler = RtlDecodePointer(exception_handler.handler)
         if isinstance(handler, int) == False:
             handler = handler.value
+
+        if idc.is_loaded(handler) == False:
+            handler = RtlDecodePointer(exception_handler.reserved)
+            if isinstance(handler, int) == False:
+                handler = handler.value
+
         idc.set_name(handler, f"VEH_{format_hex(handler)}")
         idc.add_func(handler, idc.find_func_end(handler))
         idc.apply_type(handler, idc.parse_decl(
@@ -254,6 +307,9 @@ class VehChoose(Choose):
 
         while p_exception_handler != last_exception_handler:
             p_exception_handler = exception_handler.next
+            # idc.apply_type(p_exception_handler, idc.parse_decl(
+            #     f"_VECTORED_HANDLER_ENTRY VEH_ENTRY_{format_hex(p_exception_handler)};", idc.PT_SILENT))
+
             exception_handler = VECTORED_HANDLER_ENTRY(p_exception_handler)
             handler = RtlDecodePointer(exception_handler.handler)
             if isinstance(handler, int) == False:
