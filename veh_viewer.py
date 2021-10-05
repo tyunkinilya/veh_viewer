@@ -213,10 +213,10 @@ RtlDecodePointer = Appcall.proto("ntdll_RtlDecodePointer", "PVOID __stdcall RtlD
 LdrpVectorHandlerList = 0
 
 if proc_info.is_32bit():
+    idc.add_func(p_RtlAddVectoredExceptionHandler, idc.find_func_end(p_RtlAddVectoredExceptionHandler))
     call_ea = find_insn(p_RtlAddVectoredExceptionHandler, 'call')
     p_RtlAddVectoredExceptionHandlerImpl = idc.get_operand_value(call_ea, 0)
-    idc.add_func(p_RtlAddVectoredExceptionHandlerImpl,
-                 idc.find_func_end(p_RtlAddVectoredExceptionHandlerImpl))
+    idc.add_func(p_RtlAddVectoredExceptionHandlerImpl, idc.find_func_end(p_RtlAddVectoredExceptionHandlerImpl))
     '''
     89 46 10                mov     [esi+10h], eax
     81 C3 3C 93 3A 77       add     ebx, offset LdrpVectorHandlerList
@@ -243,6 +243,7 @@ if proc_info.is_64bit():
     '''
     start = p_RtlAddVectoredExceptionHandler
     end = idc.find_func_end(start)
+    idc.add_func(start, end)
     p_insns = find_bin_mask("48 8D ?? ?? ?? ?? ?? 48 8B 0C ??", start, end)
     if p_insns != 0:
         LdrpVectorHandlerList = idc.get_operand_value(p_insns, 1)
